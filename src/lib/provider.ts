@@ -1,13 +1,13 @@
 import debug from 'debug';
 import { EventEmitter } from 'events';
+import { fromUint8Array } from 'js-base64';
+import { fromBase64 } from 'lib0/buffer';
+import { Channel } from 'pusher-js';
+import Pusher from 'pusher-js/types/src/core/pusher';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import * as Y from 'yjs';
 
-import { REALTIME_LISTEN_TYPES } from '@supabase/realtime-js/src/RealtimeChannel';
-import { Channel } from 'pusher-js';
-import Pusher from 'pusher-js/types/src/core/pusher';
-
-export interface SupabaseProviderConfig {
+export interface PingerchipsProviderConfig {
   channel: string;
   tableName: string;
   columnName: string;
@@ -17,7 +17,19 @@ export interface SupabaseProviderConfig {
   resyncInterval?: number | false;
 }
 
-export default class SupabaseProvider extends EventEmitter {
+export interface DocumentStore {
+  /**
+   * Get the latest document state.
+   */
+  get(): Promise<Uint8Array>;
+
+  /**
+   * Set the latest document state.
+   */
+  set(update: Uint8Array): Promise<void>;
+}
+
+export default class PingerchipsProvider extends EventEmitter {
   public awareness: awarenessProtocol.Awareness;
   public connected = false;
   private channel: Channel | null = null;
@@ -28,6 +40,7 @@ export default class SupabaseProvider extends EventEmitter {
   public readonly id: number;
 
   public version: number = 0;
+  private store: DocumentStore;
 
   isOnline(online?: boolean): boolean {
     if (!online && online !== false) return this.connected;
@@ -41,6 +54,7 @@ export default class SupabaseProvider extends EventEmitter {
         'document updated locally, broadcasting update to peers',
         this.isOnline()
       );
+
       this.emit('message', update);
       this.save();
     }
@@ -64,15 +78,11 @@ export default class SupabaseProvider extends EventEmitter {
   }
 
   async save() {
-    const content = Array.from(Y.encodeStateAsUpdate(this.doc));
-
-    const { error } = await this.pusher
-      .from(this.config.tableName)
-      .update({ [this.config.columnName]: content })
-      .eq(this.config.idName || 'id', this.config.id);
-
-    if (error) {
-      throw error;
+    const content = Y.encodeStateAsUpdate(this.doc);
+    try {
+      await this.store.set(content);
+    } catch (error) {
+      this.emit('error', error);
     }
 
     this.emit('save', this.version);
@@ -81,18 +91,14 @@ export default class SupabaseProvider extends EventEmitter {
   private async onConnect() {
     this.logger('connected');
 
-    const { data, error, status } = await this.pusher
-      .from(this.config.tableName)
-      .select<string, { [key: string]: number[] }>(`${this.config.columnName}`)
-      .eq(this.config.idName || 'id', this.config.id)
-      .single();
+    const data = await this.store.get();
 
-    this.logger('retrieved data from supabase', status);
+    this.logger('retrieved data from store', data);
 
-    if (data && data[this.config.columnName]) {
+    if (data) {
       this.logger('applying update to yjs');
       try {
-        this.applyUpdate(Uint8Array.from(data[this.config.columnName]));
+        this.applyUpdate(data);
       } catch (error) {
         this.logger(error);
       }
@@ -119,60 +125,91 @@ export default class SupabaseProvider extends EventEmitter {
 
   private disconnect() {
     if (this.channel) {
-      this.pusher.removeChannel(this.channel);
+      this.channel.disconnect();
       this.channel = null;
     }
   }
 
   private connect() {
     this.channel = this.pusher.subscribe(this.config.channel);
+
     if (this.channel) {
-      this.channel
-        .on(
-          REALTIME_LISTEN_TYPES.BROADCAST,
-          { event: 'message' },
-          ({ payload }) => {
-            this.onMessage(Uint8Array.from(payload), this);
-          }
-        )
-        .on(
-          REALTIME_LISTEN_TYPES.BROADCAST,
-          { event: 'awareness' },
-          ({ payload }) => {
-            this.onAwareness(Uint8Array.from(payload));
-          }
-        )
-        .subscribe((status, err) => {
-          if (status === 'SUBSCRIBED') {
-            this.emit('connect', this);
-          }
+      this.channel.bind('client-message', (data) => {
+        this.onMessage(fromBase64(data), this);
+      });
 
-          if (status === 'CHANNEL_ERROR') {
-            this.logger('CHANNEL_ERROR', err);
-            this.emit('error', this);
-          }
+      this.channel.bind('client-awareness', (data) => {
+        this.onAwareness(fromBase64(data));
+      });
 
-          if (status === 'TIMED_OUT') {
-            this.emit('disconnect', this);
-          }
+      this.channel.bind('pusher:error', (err) => {
+        this.logger('PUSHER_ERROR', err);
+        this.emit('error', this);
+        this.emit('disconnect', this);
+      });
 
-          if (status === 'CLOSED') {
-            this.emit('disconnect', this);
-          }
-        });
+      this.channel.bind('pusher:subscription_error', (err: any) => {
+        const { status } = err;
+
+        if (status === 403) {
+          this.logger('PUSHER AUTH ERROR', err);
+          this.emit('error', this);
+          this.emit('disconnect', this);
+        }
+      });
+
+      this.channel.bind('pusher:subscription_succeeded', (data) => {
+        this.logger('PUSHER_SUBSCRIPTION_SUCCEEDED', data);
+        this.emit('connect', this);
+      });
+
+      // this.channel
+      //   .on(
+      //     REALTIME_LISTEN_TYPES.BROADCAST,
+      //     { event: 'message' },
+      //     ({ payload }) => {
+      //       this.onMessage(Uint8Array.from(payload), this);
+      //     }
+      //   )
+      //   .on(
+      //     REALTIME_LISTEN_TYPES.BROADCAST,
+      //     { event: 'awareness' },
+      //     ({ payload }) => {
+      //       this.onAwareness(Uint8Array.from(payload));
+      //     }
+      //   )
+      //   .subscribe((status, err) => {
+      //     if (status === 'SUBSCRIBED') {
+      //       this.emit('connect', this);
+      //     }
+
+      //     if (status === 'CHANNEL_ERROR') {
+      //       this.logger('CHANNEL_ERROR', err);
+      //       this.emit('error', this);
+      //     }
+
+      //     if (status === 'TIMED_OUT') {
+      //       this.emit('disconnect', this);
+      //     }
+
+      //     if (status === 'CLOSED') {
+      //       this.emit('disconnect', this);
+      //     }
+      //   });
     }
   }
 
   constructor(
     private doc: Y.Doc,
     private pusher: Pusher,
-    private config: SupabaseProviderConfig
+    private config: PingerchipsProviderConfig
   ) {
     super();
 
     this.awareness =
       this.config.awareness || new awarenessProtocol.Awareness(doc);
 
+    //@ts-ignore
     this.config = config || {};
     this.id = doc.clientID;
 
@@ -185,7 +222,7 @@ export default class SupabaseProvider extends EventEmitter {
     this.logger.enabled = true;
 
     this.logger('constructor initializing');
-    this.logger('connecting to Supabase Realtime', doc.guid);
+    this.logger('connecting to Pingerchips Realtime', doc.guid);
 
     if (
       this.config.resyncInterval ||
@@ -203,11 +240,10 @@ export default class SupabaseProvider extends EventEmitter {
         this.logger('resyncing (resync interval elapsed)');
         this.emit('message', Y.encodeStateAsUpdate(this.doc));
         if (this.channel)
-          this.channel.send({
-            type: 'broadcast',
-            event: 'message',
-            payload: Array.from(Y.encodeStateAsUpdate(this.doc)),
-          });
+          this.channel.trigger(
+            'client-message',
+            fromUint8Array(Y.encodeStateAsUpdate(this.doc))
+          );
       }, this.config.resyncInterval || 5000);
     }
 
@@ -221,19 +257,11 @@ export default class SupabaseProvider extends EventEmitter {
     }
     this.on('awareness', (update) => {
       if (this.channel)
-        this.channel.send({
-          type: 'broadcast',
-          event: 'awareness',
-          payload: Array.from(update),
-        });
+        this.channel.trigger('client-awareness', fromUint8Array(update));
     });
     this.on('message', (update) => {
       if (this.channel)
-        this.channel.send({
-          type: 'broadcast',
-          event: 'message',
-          payload: Array.from(update),
-        });
+        this.channel.trigger('client-message', fromUint8Array(update));
     });
 
     this.connect();
