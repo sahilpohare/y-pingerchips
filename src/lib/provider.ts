@@ -35,7 +35,7 @@ export default class PingerchipsProvider extends EventEmitter {
   private channel: Channel | null = null;
 
   private _synced: boolean = false;
-  private resyncInterval: NodeJS.Timer | undefined;
+  private resyncInterval: any;
   protected logger: debug.Debugger;
   public readonly id: number;
 
