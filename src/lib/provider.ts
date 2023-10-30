@@ -29,7 +29,7 @@ export interface DocumentStore {
   set(update: Uint8Array): Promise<void>;
 }
 
-export default class PingerchipsProvider extends EventEmitter {
+export class PingerchipsProvider extends EventEmitter {
   public awareness: awarenessProtocol.Awareness;
   public connected = false;
   private channel: Channel | null = null;
